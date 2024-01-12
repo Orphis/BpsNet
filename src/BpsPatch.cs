@@ -5,7 +5,7 @@ namespace BpsNet
 {
     public class BpsPatch
     {
-        private byte[] Actions {  get; init; }
+        private byte[] Actions { get; init; }
 
         enum ActionType
         {
@@ -102,20 +102,20 @@ namespace BpsNet
                 uint data = ReadNumber(Actions, ref actionIndex);
                 uint command = data & 3;
                 uint length = (data >> 2) + 1;
-                switch((ActionType)command)
+                switch ((ActionType)command)
                 {
                     case ActionType.SourceRead:
-                        while(length-- > 0)
+                        while (length-- > 0)
                         {
                             target[outputOffset] = source[outputOffset];
                             outputOffset++;
                         }
                         break;
                     case ActionType.TargetRead:
-                        while(length-- > 0)
+                        while (length-- > 0)
                         {
                             target[outputOffset++] = Actions[actionIndex++];
-                        }                               
+                        }
                         break;
                     case ActionType.SourceCopy:
                         data = ReadNumber(Actions, ref actionIndex);
@@ -123,7 +123,7 @@ namespace BpsNet
                             sourceRelativeOffset += (int)(data >> 1);
                         else
                             sourceRelativeOffset -= (int)(data >> 1);
-                        while(length-- > 0)
+                        while (length-- > 0)
                         {
                             target[outputOffset++] = source[sourceRelativeOffset++];
                         }
@@ -163,7 +163,7 @@ namespace BpsNet
 
         static void WriteNumber(uint number, Stream data)
         {
-            while(true)
+            while (true)
             {
                 byte x = (byte)(number & 0x7f);
                 number >>= 7;
@@ -196,7 +196,14 @@ namespace BpsNet
 
         record PatchAction(ActionType Type, int Length, List<byte> Data, int RelativeOffset);
 
-        static public BpsPatch Create(byte[] sourceData, byte[] targetData, string metadata)
+        static public BpsPatch Create(byte[] sourceData, byte[] targetData, string metadata, bool delta = true)
+        {
+            if (delta)
+                return CreateDelta(sourceData, targetData, metadata);
+            return CreateLinear(sourceData, targetData, metadata);
+        }
+
+        static public BpsPatch CreateLinear(byte[] sourceData, byte[] targetData, string metadata)
         {
             var patchActions = new List<PatchAction>();
 
@@ -209,19 +216,20 @@ namespace BpsNet
             var outputOffset = 0;
             var targetReadLength = 0;
 
-            var targetReadFlush = () => 
+            var targetReadFlush = () =>
             {
                 if (targetReadLength > 0)
                 {
                     var action = new PatchAction(ActionType.TargetRead, targetReadLength, new(), 0);
                     patchActions.Add(action);
-	        		var offset = outputOffset - targetReadLength;
-			        while(targetReadLength > 0) {
-				        action.Data.Add(targetData[offset++]);
-				        targetReadLength--;
-			        }
+                    var offset = outputOffset - targetReadLength;
+                    while (targetReadLength > 0)
+                    {
+                        action.Data.Add(targetData[offset++]);
+                        targetReadLength--;
+                    }
                 }
-    	    };
+            };
 
             while (outputOffset < targetSize)
             {
@@ -267,29 +275,206 @@ namespace BpsNet
 
             targetReadFlush();
 
+            return new BpsPatch(sourceData, targetData, metadata, GetBytesFromActions(patchActions));
+        }
+
+        private static byte[] GetBytesFromActions(IEnumerable<PatchAction> actions)
+        {
             var memoryStream = new MemoryStream();
             memoryStream.SetLength(1 * 1024 * 1024);
 
-            foreach (var action in patchActions)
+            foreach (var action in actions)
             {
                 while (memoryStream.Position + action.Data.Count + 64 > memoryStream.Length)
                 {
                     memoryStream.SetLength(memoryStream.Length + 1024 * 1024);
                 }
                 WriteNumber((((uint)action.Length - 1) << 2) + (uint)action.Type, memoryStream);
-                if (action.Type == ActionType.TargetRead) {
+                if (action.Type == ActionType.TargetRead)
+                {
                     memoryStream.Write(action.Data.ToArray());
                 }
-                else if(action.Type == ActionType.SourceCopy || action.Type == ActionType.TargetCopy)
+                else if (action.Type == ActionType.SourceCopy || action.Type == ActionType.TargetCopy)
                 {
                     WriteNumber((uint)(Math.Abs(action.RelativeOffset) << 1) + (uint)(action.RelativeOffset < 0 ? 1 : 0), memoryStream);
                 }
             }
 
             memoryStream.SetLength(memoryStream.Position);
+            return memoryStream.ToArray();
+        }
 
-            return new BpsPatch(sourceData, targetData, metadata, memoryStream.ToArray());
+        internal record class BpsNode(int offset, BpsNode? next);
+
+        static public BpsPatch CreateDelta(byte[] sourceData, byte[] targetData, string metadata)
+        {
+            var patchActions = new List<PatchAction>();
+
+            /* references to match original beat code */
+            var sourceSize = sourceData.Length;
+            var targetSize = targetData.Length;
+            var Granularity = 1;
+
+            var sourceRelativeOffset = 0;
+            var targetRelativeOffset = 0;
+            var outputOffset = 0;
+
+
+
+            var sourceTree = new BpsNode?[65536];
+            var targetTree = new BpsNode?[65536];
+            for (var n = 0; n < 65536; n++)
+            {
+                sourceTree[n] = null;
+                targetTree[n] = null;
+            }
+
+            //source tree creation
+            for (var offset = 0; offset < sourceSize; offset++)
+            {
+                int symbol = sourceData[offset + 0];
+                //sourceChecksum = crc32_adjust(sourceChecksum, symbol);
+                if (offset < sourceSize - 1)
+                    symbol |= sourceData[offset + 1] << 8;
+                var node = new BpsNode(offset, sourceTree[symbol]);
+                sourceTree[symbol] = node;
+            }
+
+            var targetReadLength = 0;
+
+            var targetReadFlush = () =>
+            {
+                if (targetReadLength > 0)
+                {
+                    var action = new PatchAction(ActionType.TargetRead, targetReadLength, [], 0);
+                    patchActions.Add(action);
+                    var offset = outputOffset - targetReadLength;
+                    while (targetReadLength > 0)
+                    {
+                        action.Data.Add(targetData[offset++]);
+                        targetReadLength--;
+                    }
+                }
+            };
+
+            while (outputOffset < targetSize)
+            {
+                var maxLength = 0;
+                var maxOffset = 0;
+                var mode = ActionType.TargetRead;
+
+                int symbol = targetData[outputOffset + 0];
+                if (outputOffset < targetSize - 1)
+                    symbol |= targetData[outputOffset + 1] << 8;
+
+                { //source read
+                    var length = 0;
+                    var offset = outputOffset;
+                    while (offset < sourceSize && offset < targetSize && sourceData[offset] == targetData[offset])
+                    {
+                        length++;
+                        offset++;
+                    }
+                    if (length > maxLength)
+                    {
+                        maxLength = length;
+                        mode = ActionType.SourceRead;
+                    }
+                }
+
+                { //source copy
+                    var node = sourceTree[symbol];
+                    while (node != null)
+                    {
+                        var length = 0;
+                        var x = node.offset;
+                        var y = outputOffset;
+
+                        while (x < sourceSize && y < targetSize && sourceData[x++] == targetData[y++])
+                            length++;
+
+                        if (length > maxLength)
+                        {
+                            maxLength = length;
+                            maxOffset = node.offset;
+                            mode = ActionType.SourceCopy;
+                        }
+                        node = node.next;
+                    }
+                }
+
+                { //target copy
+                    var node = targetTree[symbol];
+                    while (node != null)
+                    {
+                        var length = 0;
+                        var x = node.offset;
+                        var y = outputOffset;
+
+                        while (y < targetSize && targetData[x++] == targetData[y++])
+                            length++;
+
+                        if (length > maxLength)
+                        {
+                            maxLength = length;
+                            maxOffset = node.offset;
+                            mode = ActionType.TargetCopy;
+                        }
+                        node = node.next;
+                    }
+
+                    //target tree append
+                    node = new BpsNode(outputOffset, targetTree[symbol]);
+                    targetTree[symbol] = node;
+                }
+
+                { //target read
+                    if (maxLength < 4)
+                    {
+                        maxLength = Math.Min(Granularity, targetSize - outputOffset);
+                        mode = ActionType.TargetRead;
+                    }
+                }
+
+                if (mode != ActionType.TargetRead)
+                    targetReadFlush();
+
+                switch (mode)
+                {
+                    case ActionType.SourceRead:
+                        //encode(ActionType.SourceRead | ((maxLength - 1) << 2));
+                        patchActions.Add(new PatchAction(ActionType.SourceRead, maxLength, [], 0));
+                        break;
+                    case ActionType.TargetRead:
+                        //delay write to group sequential TargetRead commands into one
+                        targetReadLength += maxLength;
+                        break;
+                    case ActionType.SourceCopy:
+                    case ActionType.TargetCopy:
+                        //encode(mode | ((maxLength - 1) << 2));
+                        int relativeOffset;
+                        if (mode == ActionType.SourceCopy)
+                        {
+                            relativeOffset = maxOffset - sourceRelativeOffset;
+                            sourceRelativeOffset = maxOffset + maxLength;
+                        }
+                        else
+                        {
+                            relativeOffset = maxOffset - targetRelativeOffset;
+                            targetRelativeOffset = maxOffset + maxLength;
+                        }
+                        //encode((relativeOffset < 0) | (abs(relativeOffset) << 1));
+                        patchActions.Add(new PatchAction(mode, maxLength, [], relativeOffset));
+                        break;
+                }
+
+                outputOffset += maxLength;
+            }
+
+            targetReadFlush();
+
+            return new BpsPatch(sourceData, targetData, metadata, GetBytesFromActions(patchActions));
         }
     }
-    
+
 }

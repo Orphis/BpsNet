@@ -16,7 +16,7 @@ namespace BspNetTest
         public void ChecksumTest()
         {
             byte[] data = File.ReadAllBytes(Path.Combine(new string[] { ProjectSourcePath.Value, "data", "gradient.bps" }));
-            BpsPatch p = new BpsPatch(data);;
+            BpsPatch p = new BpsPatch(data); ;
         }
 
         [TestMethod]
@@ -55,7 +55,7 @@ namespace BspNetTest
             byte[] original = UTF8Encoding.UTF8.GetBytes("123456700000000000012345678");
             byte[] target = UTF8Encoding.UTF8.GetBytes("123456700000001111123456999999abc0000000000");
 
-            AssertRoundTrip(original, target, "metadata with UTF-8: Hur mår du? Ça va très bien !") ;
+            AssertRoundTrip(original, target, "metadata with UTF-8: Hur mår du? Ça va très bien !");
         }
 
         [TestMethod]
@@ -82,8 +82,27 @@ namespace BspNetTest
 
         public void AssertRoundTrip(byte[] original, byte[] target, string metadata)
         {
-            BpsPatch generatedPatch = BpsPatch.Create(original, target, metadata);
+            AssertRoundTripLinear(original, target, metadata);
+            AssertRoundTripDelta(original, target, metadata);
+        }
+
+        public void AssertRoundTripLinear(byte[] original, byte[] target, string metadata)
+        {
+            BpsPatch generatedPatch = BpsPatch.Create(original, target, metadata, false);
             byte[] generatedPatchBytes = generatedPatch.GetBytes();
+            System.Console.WriteLine($"Generated a linear patch of {generatedPatchBytes.Length} bytes");
+
+            var generatedPatchRoundTrip = new BpsPatch(generatedPatchBytes);
+            var patchedRoundTrip = generatedPatchRoundTrip.Apply(original);
+            CollectionAssert.AreEqual(target, patchedRoundTrip);
+            Assert.AreEqual(generatedPatchRoundTrip.Metadata, metadata);
+        }
+
+        public void AssertRoundTripDelta(byte[] original, byte[] target, string metadata)
+        {
+            BpsPatch generatedPatch = BpsPatch.Create(original, target, metadata, true);
+            byte[] generatedPatchBytes = generatedPatch.GetBytes();
+            System.Console.WriteLine($"Generated a delta patch of {generatedPatchBytes.Length} bytes");
 
             var generatedPatchRoundTrip = new BpsPatch(generatedPatchBytes);
             var patchedRoundTrip = generatedPatchRoundTrip.Apply(original);
